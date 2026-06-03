@@ -1,2 +1,3 @@
 vosk>=0.3.45
 pyaudio>=0.2.13
+python-xlib>=0.33   # optional: enables the global Super+Esc hotkey on X11

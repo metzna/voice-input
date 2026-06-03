@@ -8,13 +8,22 @@ import os
 import queue
 import subprocess
 import threading
-import tkinter as tk
+import time
 
 VERSION = "0.1.0"
 
 # ---------------------------------------------------------------------------
 # Dependency checks
 # ---------------------------------------------------------------------------
+# Imported lazily / guarded so that --version and --help work on machines
+# without a display or GUI toolkit installed.
+
+try:
+    import tkinter as tk
+    _TK = True
+except ImportError:
+    tk = None
+    _TK = False
 
 try:
     import pyaudio
@@ -27,6 +36,12 @@ try:
     _VOSK = True
 except ImportError:
     _VOSK = False
+
+try:
+    from Xlib import X, XK, display as xdisplay
+    _XLIB = True
+except ImportError:
+    _XLIB = False
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +182,15 @@ class VoiceOverlay:
         root.resizable(False, False)
         root.configure(bg=_BG)
 
-        # overrideredirect = unmanaged window: always floats on tiling WMs,
-        # no decorations, stays on top of everything.
-        root.overrideredirect(True)
+        # Stay a *managed* window so the WM can move / rule / focus it, but
+        # hint it as a utility window. Tiling WMs (i3, bspwm, Hyprland, …)
+        # honour _NET_WM_WINDOW_TYPE and float utility windows instead of
+        # tiling them, while still keeping them under WM control.
+        try:
+            root.attributes("-type", "utility")
+        except tk.TclError:
+            pass  # non-X11 / unsupported — degrade gracefully
+        root.attributes("-topmost", True)
 
         # Position: horizontally centred, near the top of the screen.
         W, H = 320, 72
@@ -204,7 +225,9 @@ class VoiceOverlay:
                                      wraplength=296, justify=tk.LEFT)
         self._lbl_partial.pack(fill=tk.X, pady=(4, 0))
 
-        # Input bindings on the overlay itself
+        # Local ESC binding — works when the overlay itself happens to hold
+        # focus. The global Super+Esc grab (see _global_hotkey_loop) is what
+        # closes it during dictation, when focus lives in the target window.
         root.bind("<Escape>", lambda _e: self.stop())
 
         # Pulse the dot
@@ -217,6 +240,63 @@ class VoiceOverlay:
         self._dot_idx = (self._dot_idx + 1) % len(_DOT_COLORS)
         self._lbl_dot.configure(fg=_DOT_COLORS[self._dot_idx])
         self._root.after(380, self._pulse)
+
+    # ------------------------------------------------------------------
+    # Thread: global hotkey (Super+Esc)
+    # ------------------------------------------------------------------
+
+    def _global_hotkey_loop(self) -> None:
+        """Grab Super+Esc on the root window so the overlay closes from
+        anywhere, without swallowing the bare Escape key system-wide."""
+        if not _XLIB:
+            print(
+                "warning: python-xlib not installed — global Super+Esc disabled "
+                "(click the window and press Esc to close). pip install python-xlib",
+                file=sys.stderr,
+            )
+            return
+
+        try:
+            disp = xdisplay.Display()
+            root = disp.screen().root
+            keycode = disp.keysym_to_keycode(XK.XK_Escape)
+            modifier = X.Mod4Mask  # Super / Meta
+
+            # Re-grab under each lock-key combination so NumLock / CapsLock
+            # being on doesn't break the binding.
+            lock_variants = [
+                0,
+                X.LockMask,                 # CapsLock
+                X.Mod2Mask,                 # NumLock
+                X.LockMask | X.Mod2Mask,
+            ]
+            root.change_attributes(event_mask=X.KeyPressMask)
+            for lv in lock_variants:
+                root.grab_key(keycode, modifier | lv, True,
+                              X.GrabModeAsync, X.GrabModeAsync)
+            disp.sync()
+        except Exception as exc:
+            print(f"warning: could not register global hotkey: {exc}",
+                  file=sys.stderr)
+            return
+
+        try:
+            while self._running:
+                if disp.pending_events() == 0:
+                    time.sleep(0.05)
+                    continue
+                event = disp.next_event()
+                if event.type == X.KeyPress and event.detail == keycode:
+                    self._ui(self.stop)
+                    break
+        finally:
+            try:
+                for lv in lock_variants:
+                    root.ungrab_key(keycode, modifier | lv)
+                disp.sync()
+                disp.close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Thread: audio capture
@@ -302,6 +382,11 @@ class VoiceOverlay:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        if not _TK:
+            sys.exit(
+                "error: tkinter not available — install it via your package "
+                "manager (e.g. apt install python3-tk)."
+            )
         if not _PYAUDIO:
             sys.exit("error: pyaudio not installed — run: pip install pyaudio")
         if not _VOSK:
@@ -325,12 +410,15 @@ class VoiceOverlay:
         threading.Thread(target=self._audio_loop, daemon=True).start()
         threading.Thread(target=self._recognition_loop, args=(model_path,),
                          daemon=True).start()
+        threading.Thread(target=self._global_hotkey_loop, daemon=True).start()
 
-        # After our window appears, hand focus back to the target window so
-        # xdotool types there, not into our overlay.
+        # Some WMs focus a freshly-mapped window. Hand focus back to the
+        # target *once* so dictation lands there immediately; from then on the
+        # overlay never grabs focus, so the WM can still control the window
+        # (move it, focus it on demand) without disturbing the target.
         if self._target_wid:
-            self._root.after(80, lambda: _run("xdotool", "windowfocus",
-                                              "--sync", self._target_wid))
+            self._root.after(120, lambda: _run("xdotool", "windowfocus",
+                                               "--sync", self._target_wid))
 
         assert self._root is not None
         self._root.mainloop()
